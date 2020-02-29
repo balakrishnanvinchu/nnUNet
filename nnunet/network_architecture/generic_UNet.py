@@ -27,7 +27,7 @@ class ConvDropoutNormNonlin(nn.Module):
                  conv_op=nn.Conv2d, conv_kwargs=None,
                  norm_op=nn.BatchNorm2d, norm_op_kwargs=None,
                  dropout_op=nn.Dropout2d, dropout_op_kwargs=None,
-                 nonlin=nn.LeakyReLU, nonlin_kwargs=None):
+                 nonlin=nn.LeakyReLU, nonlin_kwargs=None,use_short_skips=None):
         super(ConvDropoutNormNonlin, self).__init__()
         if nonlin_kwargs is None:
             nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
@@ -46,8 +46,10 @@ class ConvDropoutNormNonlin(nn.Module):
         self.conv_kwargs = conv_kwargs
         self.conv_op = conv_op
         self.norm_op = norm_op
+        self.use_short_skips = use_short_skips
 
-        self.conv = self.conv_op(input_channels, output_channels, **self.conv_kwargs)
+        self.conv1 = self.conv_op(input_channels, output_channels, **self.conv_kwargs)
+        self.conv2 = self.conv_op(output_channels, output_channels, **self.conv_kwargs)
         if self.dropout_op is not None and self.dropout_op_kwargs['p'] is not None and self.dropout_op_kwargs[
             'p'] > 0:
             self.dropout = self.dropout_op(**self.dropout_op_kwargs)
@@ -57,10 +59,18 @@ class ConvDropoutNormNonlin(nn.Module):
         self.lrelu = self.nonlin(**self.nonlin_kwargs)
 
     def forward(self, x):
-        x = self.conv(x)
+        y = self.conv1(x)
         if self.dropout is not None:
-            x = self.dropout(x)
-        return self.lrelu(self.instnorm(x))
+            y = self.dropout(y)
+        y = self.lrelu(self.instnorm(y))
+        y = self.conv2(y)
+        if self.use_short_skips:
+            y = torch.add(x,y)
+        if self.dropout is not None:
+            y = self.dropout(y)
+        return self.lrelu(self.instnorm(y))
+        
+
 
 
 class StackedConvLayers(nn.Module):
@@ -68,8 +78,9 @@ class StackedConvLayers(nn.Module):
                  conv_op=nn.Conv2d, conv_kwargs=None,
                  norm_op=nn.BatchNorm2d, norm_op_kwargs=None,
                  dropout_op=nn.Dropout2d, dropout_op_kwargs=None,
-                 nonlin=nn.LeakyReLU, nonlin_kwargs=None, first_stride=None):
+                 nonlin=nn.LeakyReLU, nonlin_kwargs=None, first_stride=None, use_short_skips=None):
         '''
+        Modified(@Tejal Singh): input_feature_channels should be equal to output_feature_channels to incorporate short skip connection
         stacks ConvDropoutNormLReLU layers. initial_stride will only be applied to first layer in the stack. The other parameters affect all layers
         :param input_feature_channels:
         :param output_feature_channels:
@@ -107,6 +118,7 @@ class StackedConvLayers(nn.Module):
         self.conv_kwargs = conv_kwargs
         self.conv_op = conv_op
         self.norm_op = norm_op
+        self.use_short_skips = use_short_skips
 
         if first_stride is not None:
             self.conv_kwargs_first_conv = deepcopy(conv_kwargs)
@@ -117,13 +129,13 @@ class StackedConvLayers(nn.Module):
         super(StackedConvLayers, self).__init__()
         self.blocks = nn.Sequential(
             *([ConvDropoutNormNonlin(input_feature_channels, output_feature_channels, self.conv_op,
-                                     self.conv_kwargs_first_conv,
+                                     self.conv_kwargs,
                                      self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs,
-                                     self.nonlin, self.nonlin_kwargs)] +
+                                     self.nonlin, self.nonlin_kwargs,use_short_skips=self.use_short_skips)] +
               [ConvDropoutNormNonlin(output_feature_channels, output_feature_channels, self.conv_op,
                                      self.conv_kwargs,
                                      self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs,
-                                     self.nonlin, self.nonlin_kwargs) for _ in range(num_convs - 1)]))
+                                     self.nonlin, self.nonlin_kwargs, use_short_skips=self.use_short_skips) for _ in range(num_convs - 1)]))
 
     def forward(self, x):
         return self.blocks(x)
@@ -253,27 +265,35 @@ class Generic_UNet(SegmentationNetwork):
         output_features = base_num_features
         input_features = input_channels
 
+        short_skips = False
+
         for d in range(num_pool):
             # determine the first stride
             if d != 0 and self.convolutional_pooling:
                 first_stride = pool_op_kernel_sizes[d-1]
+                use_short_skips = short_skips
             else:
                 first_stride = None
+                use_short_skips = False
 
             self.conv_kwargs['kernel_size'] = self.conv_kernel_sizes[d]
             self.conv_kwargs['padding'] = self.conv_pad_sizes[d]
             # add convolutions
-            self.conv_blocks_context.append(StackedConvLayers(input_features, output_features, num_conv_per_stage,
+            self.conv_blocks_context.append(StackedConvLayers(input_features, output_features, 1,
                                                               self.conv_op, self.conv_kwargs, self.norm_op,
                                                               self.norm_op_kwargs, self.dropout_op,
                                                               self.dropout_op_kwargs, self.nonlin, self.nonlin_kwargs,
-                                                              first_stride))
-            if not self.convolutional_pooling:
-                self.td.append(pool_op(pool_op_kernel_sizes[d]))
+                                                              first_stride,use_short_skips=use_short_skips))
+
             input_features = output_features
             output_features = int(np.round(output_features * feat_map_mul_on_downscale))
-
             output_features = min(output_features, self.max_num_features)
+
+            if not self.convolutional_pooling:
+                self.td.append(pool_op(pool_op_kernel_sizes[d]))
+            else:
+                self.td.append(conv_op(input_features, output_features, pool_op_kernel_sizes[d], pool_op_kernel_sizes[d], 0, 1, 1, False))
+            input_features = output_features
 
 
         # now the bottleneck.
@@ -293,13 +313,9 @@ class Generic_UNet(SegmentationNetwork):
 
         self.conv_kwargs['kernel_size'] = self.conv_kernel_sizes[num_pool]
         self.conv_kwargs['padding'] = self.conv_pad_sizes[num_pool]
-        self.conv_blocks_context.append(nn.Sequential(
-            StackedConvLayers(input_features, output_features, num_conv_per_stage - 1, self.conv_op, self.conv_kwargs,
+        self.conv_blocks_context.append(StackedConvLayers(input_features, output_features, 1, self.conv_op, self.conv_kwargs,
                               self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs, self.nonlin,
-                              self.nonlin_kwargs, first_stride),
-            StackedConvLayers(output_features, final_num_features, 1, self.conv_op, self.conv_kwargs,
-                              self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs, self.nonlin,
-                              self.nonlin_kwargs)))
+                              self.nonlin_kwargs, first_stride,use_short_skips=short_skips))
 
         # if we don't want to do dropout in the localization pathway then we set the dropout prob to zero here
         if not dropout_in_localization:
@@ -326,19 +342,15 @@ class Generic_UNet(SegmentationNetwork):
                 self.tu.append(transpconv(nfeatures_from_down, nfeatures_from_skip, pool_op_kernel_sizes[-(u+1)],
                                           pool_op_kernel_sizes[-(u+1)], bias=False))
 
-            self.conv_kwargs['kernel_size'] = self.conv_kernel_sizes[- (u+1)]
-            self.conv_kwargs['padding'] = self.conv_pad_sizes[- (u+1)]
-            self.conv_blocks_localization.append(nn.Sequential(
-                StackedConvLayers(n_features_after_tu_and_concat, nfeatures_from_skip, num_conv_per_stage - 1,
+            self.conv_kwargs['kernel_size'] = self.conv_kernel_sizes[- (u+2)]           # check this ???
+            self.conv_kwargs['padding'] = self.conv_pad_sizes[- (u+2)]                  # check this ???
+
+            self.conv_blocks_localization.append(StackedConvLayers(nfeatures_from_skip, nfeatures_from_skip, 1,
                                   self.conv_op, self.conv_kwargs, self.norm_op, self.norm_op_kwargs, self.dropout_op,
-                                  self.dropout_op_kwargs, self.nonlin, self.nonlin_kwargs),
-                StackedConvLayers(nfeatures_from_skip, final_num_features, 1, self.conv_op, self.conv_kwargs,
-                                  self.norm_op, self.norm_op_kwargs, self.dropout_op, self.dropout_op_kwargs,
-                                  self.nonlin, self.nonlin_kwargs)
-            ))
+                                  self.dropout_op_kwargs, self.nonlin, self.nonlin_kwargs,use_short_skips=short_skips))
 
         for ds in range(len(self.conv_blocks_localization)):
-            self.seg_outputs.append(conv_op(self.conv_blocks_localization[ds][-1].output_channels, num_classes,
+            self.seg_outputs.append(conv_op(self.conv_blocks_localization[ds].output_channels, num_classes,
                                             1, 1, 0, 1, 1, False))
 
         self.upscale_logits_ops = []
@@ -372,14 +384,13 @@ class Generic_UNet(SegmentationNetwork):
         for d in range(len(self.conv_blocks_context) - 1):
             x = self.conv_blocks_context[d](x)
             skips.append(x)
-            if not self.convolutional_pooling:
-                x = self.td[d](x)
+            x = self.td[d](x)
 
         x = self.conv_blocks_context[-1](x)
 
         for u in range(len(self.tu)):
             x = self.tu[u](x)
-            x = torch.cat((x, skips[-(u + 1)]), dim=1)
+            x = torch.add(x, skips[-(u + 1)])
             x = self.conv_blocks_localization[u](x)
             seg_outputs.append(self.final_nonlin(self.seg_outputs[u](x)))
 
